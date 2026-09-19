@@ -63,43 +63,35 @@ func (s *BalanceService) Run(ctx context.Context, request dto.RunBalanceRequest,
 	if tank.TankStatus != "active" {
 		return model.BalanceRun{}, api.NewError(409, "TANK_NOT_ACTIVE", "只有启用储罐可以运行质量平衡")
 	}
-	opening, closing, err := s.measurementRepo.BoundarySnapshots(ctx, tank.ID, start, end)
-	if err != nil {
-		return model.BalanceRun{}, err
-	}
-	transfers, err := s.transferRepo.ConfirmedForPeriod(ctx, tank.ID, start, end)
-	if err != nil {
-		return model.BalanceRun{}, err
-	}
-	calculation, snapshotJSON, evidenceJSON, err := calculateBalanceRun(tank, opening, closing, transfers, start, end)
-	if err != nil {
-		return model.BalanceRun{}, err
-	}
-	run := model.BalanceRun{
-		TankID:             tank.ID,
-		PeriodStart:        start,
-		PeriodEnd:          end,
-		BalanceStatus:      constants.BalanceCalculating,
-		InputSnapshotJSON:  datatypes.JSON(snapshotJSON),
-		EvidenceJSON:       datatypes.JSON(evidenceJSON),
-		OpeningMassKG:      calculation.OpeningMassKG,
-		ClosingMassKG:      calculation.ClosingMassKG,
-		NetTransferKG:      calculation.NetTransferKG,
-		EstimatedBOGKG:     calculation.EstimatedBOGKG,
-		UncertaintyKG:      calculation.UncertaintyKG,
-		IntervalLowerKG:    calculation.IntervalLowerKG,
-		IntervalUpperKG:    calculation.IntervalUpperKG,
-		DeviationPct:       calculation.DeviationPct,
-		DeviationLevel:     calculation.DeviationLevel,
-		CoefficientVersion: tank.CoefficientVersion,
-		Version:            2,
-		CreatedBy:          actor.UserID,
-	}
-	if err := s.repo.CreateCalculated(ctx, &run, actor); err != nil {
-		return model.BalanceRun{}, err
-	}
-	run.Tank = &tank
-	return run, nil
+	return s.repo.RunCalculation(ctx, tank.ID, start, end, actor, func(input repository.PeriodBalanceInput) (*model.BalanceRun, error) {
+		if input.Tank.TankStatus != "active" {
+			return nil, api.NewError(409, "TANK_NOT_ACTIVE", "只有启用储罐可以运行质量平衡")
+		}
+		calculation, snapshotJSON, evidenceJSON, err := calculateBalanceRun(input.Tank, input.Opening, input.Closing, input.Transfers, start, end)
+		if err != nil {
+			return nil, err
+		}
+		return &model.BalanceRun{
+			TankID:             input.Tank.ID,
+			PeriodStart:        start,
+			PeriodEnd:          end,
+			BalanceStatus:      constants.BalanceCalculating,
+			InputSnapshotJSON:  datatypes.JSON(snapshotJSON),
+			EvidenceJSON:       datatypes.JSON(evidenceJSON),
+			OpeningMassKG:      calculation.OpeningMassKG,
+			ClosingMassKG:      calculation.ClosingMassKG,
+			NetTransferKG:      calculation.NetTransferKG,
+			EstimatedBOGKG:     calculation.EstimatedBOGKG,
+			UncertaintyKG:      calculation.UncertaintyKG,
+			IntervalLowerKG:    calculation.IntervalLowerKG,
+			IntervalUpperKG:    calculation.IntervalUpperKG,
+			DeviationPct:       calculation.DeviationPct,
+			DeviationLevel:     calculation.DeviationLevel,
+			CoefficientVersion: input.Tank.CoefficientVersion,
+			Version:            2,
+			CreatedBy:          actor.UserID,
+		}, nil
+	})
 }
 
 type calculatedBalance struct {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"lng-boiloff-gas-balance/backend/internal/constants"
 	"lng-boiloff-gas-balance/backend/internal/model"
@@ -93,6 +94,24 @@ func (r *TankRepository) Update(ctx context.Context, updated, before model.Stora
 		return nil
 	})
 	return updated, err
+}
+
+// LockForUpdate reloads the tank row inside a transaction with a row lock so that
+// concurrent measurement/transfer writes and balance runs for the same tank
+// serialize. SQLite has no row locks; GORM strips the clause for that dialect.
+func LockForUpdate(tx *gorm.DB, tankID uint) (model.StorageTank, error) {
+	var tank model.StorageTank
+	query := tx
+	if tx.Dialector.Name() == "postgres" {
+		query = tx.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	if err := query.First(&tank, tankID).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return model.StorageTank{}, api.NewError(404, "TANK_NOT_FOUND", "储罐不存在")
+		}
+		return model.StorageTank{}, fmt.Errorf("lock storage tank: %w", err)
+	}
+	return tank, nil
 }
 
 func (r *TankRepository) MeasurementQuality(ctx context.Context, tankID uint) (total, good, suspect, invalid int64, latest *model.MeasurementSnapshot, err error) {

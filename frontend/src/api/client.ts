@@ -7,7 +7,8 @@ export class ApiError extends Error {
     message: string,
     public readonly status: number,
     public readonly code: string,
-    public readonly requestId?: string
+    public readonly requestId?: string,
+    public readonly details?: Record<string, unknown>
   ) {
     super(message)
   }
@@ -33,13 +34,14 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
       payload.error?.message ?? `请求失败 (${response.status})`,
       response.status,
       payload.error?.code ?? 'REQUEST_FAILED',
-      payload.request_id
+      payload.request_id,
+      payload.error?.details
     )
     if (response.status === 401 && path !== '/auth/login') {
       sessionStorage.removeItem(tokenKey)
       window.dispatchEvent(new Event('auth:expired'))
     }
-    window.dispatchEvent(new CustomEvent('api:error', { detail: error.message + (error.requestId ? ' · ' + error.requestId : '') }))
+    window.dispatchEvent(new CustomEvent('api:error', { detail: { message: error.message, code: error.code, details: error.details, requestId: error.requestId } }))
     throw error
   }
   return payload.data

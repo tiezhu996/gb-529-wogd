@@ -69,6 +69,9 @@ func (r *MeasurementRepository) Get(ctx context.Context, id uint) (model.Measure
 
 func (r *MeasurementRepository) Create(ctx context.Context, snapshot *model.MeasurementSnapshot, actor Actor) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := LockForUpdate(tx, snapshot.TankID); err != nil {
+			return err
+		}
 		var existing int64
 		if err := tx.Model(&model.MeasurementSnapshot{}).
 			Where("tank_id = ? AND measured_at = ?", snapshot.TankID, snapshot.MeasuredAt).
@@ -90,8 +93,15 @@ func (r *MeasurementRepository) Create(ctx context.Context, snapshot *model.Meas
 }
 
 func (r *MeasurementRepository) BoundarySnapshots(ctx context.Context, tankID uint, periodStart, periodEnd time.Time) (model.MeasurementSnapshot, model.MeasurementSnapshot, error) {
+	return boundarySnapshots(r.db.WithContext(ctx), tankID, periodStart, periodEnd)
+}
+
+// boundarySnapshots re-reads opening and closing snapshots inside the caller's
+// transaction so the balance always sees the same immutable evidence that will
+// be persisted in its replay snapshot.
+func boundarySnapshots(tx *gorm.DB, tankID uint, periodStart, periodEnd time.Time) (model.MeasurementSnapshot, model.MeasurementSnapshot, error) {
 	var opening model.MeasurementSnapshot
-	openingQuery := r.db.WithContext(ctx).
+	openingQuery := tx.
 		Where("tank_id = ? AND measured_at <= ? AND quality_flag <> ?", tankID, periodStart.UTC(), constants.QualityInvalid).
 		Order("measured_at DESC, id DESC").First(&opening)
 	if openingQuery.Error != nil {
@@ -101,7 +111,7 @@ func (r *MeasurementRepository) BoundarySnapshots(ctx context.Context, tankID ui
 		return model.MeasurementSnapshot{}, model.MeasurementSnapshot{}, fmt.Errorf("load opening snapshot: %w", openingQuery.Error)
 	}
 	var closing model.MeasurementSnapshot
-	closingQuery := r.db.WithContext(ctx).
+	closingQuery := tx.
 		Where("tank_id = ? AND measured_at >= ? AND measured_at <= ? AND quality_flag <> ?", tankID, periodStart.UTC(), periodEnd.UTC(), constants.QualityInvalid).
 		Order("measured_at DESC, id DESC").First(&closing)
 	if closingQuery.Error != nil {

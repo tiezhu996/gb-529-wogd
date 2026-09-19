@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Alert, Button, Form, Input, Modal, Select, Table, Tag } from 'antd'
+import { Alert, Button, Descriptions, Form, Input, Modal, Select, Table, Tag } from 'antd'
 import { CheckCircle2, Play, RefreshCw, Send, XCircle } from 'lucide-react'
 import { EvidenceBreakdownPanel } from '../components/common/EvidenceBreakdownPanel'
 import { MassBalanceWaterfall } from '../components/common/MassBalanceWaterfall'
 import { PageHeader } from '../components/common/PageHeader'
+import { ApiError } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { useBalanceRun } from '../hooks/useBalanceRun'
 import { useTankStore } from '../stores/tankStore'
@@ -16,11 +17,47 @@ const statusLabels: Record<BalanceStatus, string> = {
   accepted: '已接受', rejected: '已驳回', invalidated: '已作废'
 }
 
+const boundaryLabels: Record<string, string> = {
+  period_start: '期间起点',
+  period_end: '期间终点'
+}
+
+function RunRejectionAlert({ error }: { error: ApiError }) {
+  const details = error.details ?? {}
+  const transferID = details.transfer_id as number | undefined
+  const crossedAt = details.crossed_at as string | undefined
+  const crossedBoundary = details.crossed_boundary as string | undefined
+  return (
+    <Alert
+      className="form-alert"
+      type="error"
+      showIcon
+      message="计算被拒绝，未生成平衡记录"
+      description={
+        <div>
+          <div>{error.message}</div>
+          {transferID !== undefined && (
+            <Descriptions className="rejection-details" size="small" column={1} colon={false}>
+              <Descriptions.Item label="转移编号">#{transferID}</Descriptions.Item>
+              {typeof details.operation_type === 'string' && <Descriptions.Item label="转移类型">{details.operation_type === 'inflow' ? '流入' : '流出'}</Descriptions.Item>}
+              {typeof crossedBoundary === 'string' && <Descriptions.Item label="越界边界">{boundaryLabels[crossedBoundary] ?? crossedBoundary}</Descriptions.Item>}
+              {crossedAt && <Descriptions.Item label="越界时刻">{dateTime(crossedAt)}</Descriptions.Item>}
+              {typeof details.counterparty_ref === 'string' && details.counterparty_ref && <Descriptions.Item label="物理参考">{details.counterparty_ref as string}</Descriptions.Item>}
+            </Descriptions>
+          )}
+          <div className="secondary">请先取消该越界转移或调整平衡期间后重试；草稿和已取消转移不会参与计算。</div>
+        </div>
+      }
+    />
+  )
+}
+
 export function BalancesPage() {
   const { user, can } = useAuth()
   const store = useBalanceRun()
   const tanks = useTankStore()
   const [runOpen, setRunOpen] = useState(false)
+  const [runError, setRunError] = useState<ApiError | null>(null)
   const [reviewTarget, setReviewTarget] = useState<'accepted' | 'rejected'>('accepted')
   const [reviewOpen, setReviewOpen] = useState(false)
   const [runForm] = Form.useForm<BalanceRunInput>()
@@ -28,16 +65,22 @@ export function BalancesPage() {
   useEffect(() => { void Promise.all([store.load(), tanks.load()]) }, [])
   const selected = useMemo(() => store.items.find((item) => item.id === store.selectedId) ?? store.items[0], [store.items, store.selectedId])
   const openRun = () => {
+    setRunError(null)
     runForm.setFieldsValue({ tank_id: tanks.items[0]?.id })
     setRunOpen(true)
   }
   const run = async (values: BalanceRunInput) => {
-    await store.run({
-      tank_id: values.tank_id,
-      period_start: new Date(values.period_start).toISOString(),
-      period_end: new Date(values.period_end).toISOString()
-    })
-    setRunOpen(false)
+    setRunError(null)
+    try {
+      await store.run({
+        tank_id: values.tank_id,
+        period_start: new Date(values.period_start).toISOString(),
+        period_end: new Date(values.period_end).toISOString()
+      })
+      setRunOpen(false)
+    } catch (error) {
+      setRunError(error instanceof ApiError ? error : new ApiError('计算请求失败，请稍后重试', 0, 'RUN_FAILED'))
+    }
   }
   const review = async ({ note }: { note: string }) => {
     if (!selected) return
@@ -127,6 +170,7 @@ export function BalancesPage() {
             <Form.Item name="period_end" label="期间结束" rules={[{ required: true }]}><Input type="datetime-local" /></Form.Item>
           </div>
           <Alert className="form-alert" type="warning" showIcon message="系统将选择期间边界有效快照并固化当前罐容系数；既有结果不会被覆盖。" />
+          {runError && <RunRejectionAlert error={runError} />}
           <Button type="primary" htmlType="submit" icon={<Play size={16} />} loading={store.working} block>执行计算</Button>
         </Form>
       </Modal>

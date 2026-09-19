@@ -70,6 +70,9 @@ func (r *TransferRepository) Get(ctx context.Context, id uint) (model.TransferOp
 
 func (r *TransferRepository) Create(ctx context.Context, item *model.TransferOperation, actor Actor) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := LockForUpdate(tx, item.TankID); err != nil {
+			return err
+		}
 		var overlaps int64
 		if err := tx.Model(&model.TransferOperation{}).
 			Where("tank_id = ? AND operation_status <> ? AND start_at < ? AND end_at > ?", item.TankID, "cancelled", item.EndAt, item.StartAt).
@@ -99,6 +102,9 @@ func (r *TransferRepository) Transition(ctx context.Context, id, version uint, t
 				return api.NewError(404, "TRANSFER_NOT_FOUND", "物理转移记录不存在")
 			}
 			return fmt.Errorf("load transfer operation: %w", err)
+		}
+		if _, err := LockForUpdate(tx, before.TankID); err != nil {
+			return err
 		}
 		if before.Version != version {
 			return api.NewError(409, "TRANSFER_VERSION_CONFLICT", "物理转移记录版本已变化，请刷新后重试")
@@ -132,11 +138,54 @@ func (r *TransferRepository) Transition(ctx context.Context, id, version uint, t
 }
 
 func (r *TransferRepository) ConfirmedForPeriod(ctx context.Context, tankID uint, start, end time.Time) ([]model.TransferOperation, error) {
-	var items []model.TransferOperation
-	if err := r.db.WithContext(ctx).
-		Where("tank_id = ? AND operation_status = ? AND start_at >= ? AND end_at <= ?", tankID, "confirmed", start.UTC(), end.UTC()).
-		Order("start_at ASC, id ASC").Find(&items).Error; err != nil {
+	return confirmedForPeriodTx(r.db.WithContext(ctx), tankID, start, end)
+}
+
+// confirmedForPeriodTx re-reads the physical transfers inside the balance
+// transaction. Only confirmed operations that lie completely inside the period
+// (start_at >= period start AND end_at <= period end) are returned. A confirmed
+// operation that merely overlaps the period necessarily crosses one boundary;
+// it must not be silently dropped or prorated, so the whole run is rejected with
+// the operation number and the exact out-of-bound timestamp. Drafts and
+// cancelled records are never queried and therefore never affect the result.
+func confirmedForPeriodTx(tx *gorm.DB, tankID uint, periodStart, periodEnd time.Time) ([]model.TransferOperation, error) {
+	var overlapping []model.TransferOperation
+	if err := tx.
+		Where("tank_id = ? AND operation_status = ? AND start_at < ? AND end_at > ?", tankID, "confirmed", periodEnd.UTC(), periodStart.UTC()).
+		Order("start_at ASC, id ASC").Find(&overlapping).Error; err != nil {
 		return nil, fmt.Errorf("list confirmed period transfers: %w", err)
 	}
-	return items, nil
+	contained := make([]model.TransferOperation, 0, len(overlapping))
+	for _, item := range overlapping {
+		switch {
+		case !item.StartAt.Before(periodStart) && !item.EndAt.After(periodEnd):
+			contained = append(contained, item)
+		case item.StartAt.Before(periodStart):
+			return nil, periodBoundaryError(item, "period_start", item.StartAt, periodStart)
+		default:
+			return nil, periodBoundaryError(item, "period_end", item.EndAt, periodEnd)
+		}
+	}
+	return contained, nil
+}
+
+func periodBoundaryError(item model.TransferOperation, boundary string, crossedAt, boundaryAt time.Time) error {
+	return api.WithDetails(api.NewError(422, "TRANSFER_CROSSES_PERIOD_BOUNDARY",
+		fmt.Sprintf("已确认物理转移 #%d 在 %s 跨越平衡期间%s边界，必须先取消或改用完全落入期间的转移记录", item.ID, crossedAt.UTC().Format(time.RFC3339), boundaryName(boundary))), map[string]any{
+		"transfer_id":       item.ID,
+		"operation_type":    item.OperationType,
+		"counterparty_ref":  item.CounterpartyRef,
+		"transfer_start_at": item.StartAt.UTC(),
+		"transfer_end_at":   item.EndAt.UTC(),
+		"crossed_boundary":  boundary,
+		"boundary_at":       boundaryAt.UTC(),
+		"crossed_at":        crossedAt.UTC(),
+	})
+}
+
+func boundaryName(boundary string) string {
+	if boundary == "period_start" {
+		return "起点"
+	}
+	return "终点"
 }

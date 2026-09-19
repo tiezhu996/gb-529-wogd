@@ -4,10 +4,33 @@ import zhCN from 'antd/locale/zh_CN'
 import { RouterProvider } from 'react-router-dom'
 import { router } from './router'
 
+interface ApiErrorDetail {
+  message?: string
+  code?: string
+  details?: Record<string, unknown>
+  requestId?: string
+}
+
+function describeApiError(detail: string | ApiErrorDetail): string {
+  if (typeof detail === 'string') return detail
+  const parts = [detail.message]
+  if (detail.details) {
+    const transferID = detail.details.transfer_id
+    const crossedAt = detail.details.crossed_at
+    if (transferID !== undefined) parts.push(`转移编号 #${String(transferID)}`)
+    if (typeof crossedAt === 'string') parts.push(`越界时刻 ${crossedAt}`)
+  }
+  if (detail.requestId) parts.push(`请求 ${detail.requestId}`)
+  return parts.filter(Boolean).join(' · ')
+}
+
 function ApiMessages() {
   const [messageApi, contextHolder] = message.useMessage()
   useEffect(() => {
-    const listener = (event: Event) => void messageApi.error((event as CustomEvent<string>).detail)
+    const listener = (event: Event) => {
+      const detail = (event as CustomEvent<string | ApiErrorDetail>).detail
+      void messageApi.error(describeApiError(detail), 6)
+    }
     window.addEventListener('api:error', listener)
     return () => window.removeEventListener('api:error', listener)
   }, [messageApi])

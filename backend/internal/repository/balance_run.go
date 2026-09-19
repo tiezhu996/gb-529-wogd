@@ -59,6 +59,79 @@ func (r *BalanceRepository) Get(ctx context.Context, id uint) (model.BalanceRun,
 	return run, nil
 }
 
+// PeriodBalanceInput holds the re-read evidence gathered inside the balance
+// transaction; the service performs pure calculation from this immutable set.
+type PeriodBalanceInput struct {
+	Tank      model.StorageTank
+	Opening   model.MeasurementSnapshot
+	Closing   model.MeasurementSnapshot
+	Transfers []model.TransferOperation
+}
+
+// RunCalculation executes the whole balance computation in one transaction: it
+// locks the tank row, re-reads opening/closing snapshots and physical transfers
+// at that point in time, hands the evidence to calculate, and only then inserts
+// the balance run and audit events. Any boundary error aborts the transaction,
+// so a rejected request never leaves a balance record. Concurrent confirmations
+// or cancellations for the same tank block on the tank row lock and are
+// re-checked once acquired.
+func (r *BalanceRepository) RunCalculation(
+	ctx context.Context,
+	tankID uint,
+	periodStart, periodEnd time.Time,
+	actor Actor,
+	calculate func(PeriodBalanceInput) (*model.BalanceRun, error),
+) (model.BalanceRun, error) {
+	var run model.BalanceRun
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		tank, err := LockForUpdate(tx, tankID)
+		if err != nil {
+			return err
+		}
+		opening, closing, err := boundarySnapshots(tx, tankID, periodStart, periodEnd)
+		if err != nil {
+			return err
+		}
+		transfers, err := confirmedForPeriodTx(tx, tankID, periodStart, periodEnd)
+		if err != nil {
+			return err
+		}
+		calculated, err := calculate(PeriodBalanceInput{
+			Tank: tank, Opening: opening, Closing: closing, Transfers: transfers,
+		})
+		if err != nil {
+			return err
+		}
+		if err := tx.Create(calculated).Error; err != nil {
+			return fmt.Errorf("create calculated balance run: %w", err)
+		}
+		queuedAudit := NewAudit(actor, "balance_run.queued", "balance_run", calculated.ID, nil, map[string]any{
+			"tank_id": calculated.TankID, "period_start": calculated.PeriodStart, "period_end": calculated.PeriodEnd,
+		})
+		if err := tx.Create(&queuedAudit).Error; err != nil {
+			return fmt.Errorf("audit queued balance run: %w", err)
+		}
+		calculatedAudit := NewAudit(actor, "balance_run.calculated", "balance_run", calculated.ID, map[string]any{"status": constants.BalanceQueued}, map[string]any{
+			"status": calculated.BalanceStatus, "estimated_bog_kg": calculated.EstimatedBOGKG,
+			"uncertainty_kg": calculated.UncertaintyKG, "deviation_level": calculated.DeviationLevel,
+			"coefficient_version": calculated.CoefficientVersion,
+		})
+		if err := tx.Create(&calculatedAudit).Error; err != nil {
+			return fmt.Errorf("audit balance calculation: %w", err)
+		}
+		run = *calculated
+		return nil
+	})
+	if err != nil {
+		return model.BalanceRun{}, err
+	}
+	var tank model.StorageTank
+	if loadErr := r.db.WithContext(ctx).First(&tank, tankID).Error; loadErr == nil {
+		run.Tank = &tank
+	}
+	return run, nil
+}
+
 func (r *BalanceRepository) CreateCalculated(ctx context.Context, run *model.BalanceRun, actor Actor) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(run).Error; err != nil {
