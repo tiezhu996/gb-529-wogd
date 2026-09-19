@@ -27,6 +27,74 @@ func NewBalanceRepository(db *gorm.DB) *BalanceRepository {
 	return &BalanceRepository{db: db}
 }
 
+// WithTx returns a repository bound to an existing transaction.
+func (r *BalanceRepository) WithTx(tx *gorm.DB) *BalanceRepository { return &BalanceRepository{db: tx} }
+
+// PeriodInputs bundles the consistent-in-time inputs re-read inside the
+// calculation transaction.
+type PeriodInputs struct {
+	Tank     model.StorageTank
+	Opening  model.MeasurementSnapshot
+	Closing  model.MeasurementSnapshot
+	Transfer []model.TransferOperation
+}
+
+// CalculateFunc is the domain calculation performed against inputs that have
+// been locked and re-read inside the calculation transaction.
+type CalculateFunc func(inputs PeriodInputs) (*model.BalanceRun, error)
+
+// CalculateAndStore closes the period boundary inside one transaction: it
+// locks the tank row, then re-reads the opening snapshot, closing snapshot and
+// every confirmed physical transfer from the same transactional snapshot, and
+// only persists the run (with its audits) when the calculation succeeds. A
+// rejection rolls the whole transaction back, so no balance record or audit is
+// left behind.
+func (r *BalanceRepository) CalculateAndStore(ctx context.Context, tankID uint, start, end time.Time, actor Actor, calculate CalculateFunc) (model.BalanceRun, error) {
+	var stored model.BalanceRun
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		tankRepo := NewTankRepository(tx)
+		tank, err := tankRepo.LockForUpdate(ctx, tankID)
+		if err != nil {
+			return err
+		}
+		if tank.TankStatus != "active" {
+			return api.NewError(409, "TANK_NOT_ACTIVE", "只有启用储罐可以运行质量平衡")
+		}
+		opening, closing, err := NewMeasurementRepository(tx).BoundarySnapshots(ctx, tankID, start, end)
+		if err != nil {
+			return err
+		}
+		transfers, err := NewTransferRepository(tx).ConfirmedIntersectingPeriod(ctx, tankID, start, end)
+		if err != nil {
+			return err
+		}
+		run, err := calculate(PeriodInputs{Tank: tank, Opening: opening, Closing: closing, Transfer: transfers})
+		if err != nil {
+			return err
+		}
+		if err := tx.Create(run).Error; err != nil {
+			return fmt.Errorf("create calculated balance run: %w", err)
+		}
+		queuedAudit := NewAudit(actor, "balance_run.queued", "balance_run", run.ID, nil, map[string]any{
+			"tank_id": run.TankID, "period_start": run.PeriodStart, "period_end": run.PeriodEnd,
+		})
+		if err := tx.Create(&queuedAudit).Error; err != nil {
+			return fmt.Errorf("audit queued balance run: %w", err)
+		}
+		calculatedAudit := NewAudit(actor, "balance_run.calculated", "balance_run", run.ID, map[string]any{"status": constants.BalanceQueued}, map[string]any{
+			"status": run.BalanceStatus, "estimated_bog_kg": run.EstimatedBOGKG,
+			"uncertainty_kg": run.UncertaintyKG, "deviation_level": run.DeviationLevel,
+			"coefficient_version": run.CoefficientVersion,
+		})
+		if err := tx.Create(&calculatedAudit).Error; err != nil {
+			return fmt.Errorf("audit balance calculation: %w", err)
+		}
+		stored = *run
+		return nil
+	})
+	return stored, err
+}
+
 func (r *BalanceRepository) List(ctx context.Context, filter BalanceFilter) ([]model.BalanceRun, int64, error) {
 	filter.Page, filter.PageSize = normalizePage(filter.Page, filter.PageSize)
 	query := r.db.WithContext(ctx).Model(&model.BalanceRun{})
@@ -57,29 +125,6 @@ func (r *BalanceRepository) Get(ctx context.Context, id uint) (model.BalanceRun,
 		return model.BalanceRun{}, fmt.Errorf("get balance run: %w", err)
 	}
 	return run, nil
-}
-
-func (r *BalanceRepository) CreateCalculated(ctx context.Context, run *model.BalanceRun, actor Actor) error {
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(run).Error; err != nil {
-			return fmt.Errorf("create calculated balance run: %w", err)
-		}
-		queuedAudit := NewAudit(actor, "balance_run.queued", "balance_run", run.ID, nil, map[string]any{
-			"tank_id": run.TankID, "period_start": run.PeriodStart, "period_end": run.PeriodEnd,
-		})
-		if err := tx.Create(&queuedAudit).Error; err != nil {
-			return fmt.Errorf("audit queued balance run: %w", err)
-		}
-		calculatedAudit := NewAudit(actor, "balance_run.calculated", "balance_run", run.ID, map[string]any{"status": constants.BalanceQueued}, map[string]any{
-			"status": run.BalanceStatus, "estimated_bog_kg": run.EstimatedBOGKG,
-			"uncertainty_kg": run.UncertaintyKG, "deviation_level": run.DeviationLevel,
-			"coefficient_version": run.CoefficientVersion,
-		})
-		if err := tx.Create(&calculatedAudit).Error; err != nil {
-			return fmt.Errorf("audit balance calculation: %w", err)
-		}
-		return nil
-	})
 }
 
 func (r *BalanceRepository) Transition(ctx context.Context, id, version uint, target constants.BalanceStatus, note string, reviewerID *uint, actor Actor) (model.BalanceRun, error) {

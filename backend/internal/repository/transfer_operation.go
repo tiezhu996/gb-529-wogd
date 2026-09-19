@@ -27,6 +27,12 @@ type TransferRepository struct {
 
 func NewTransferRepository(db *gorm.DB) *TransferRepository { return &TransferRepository{db: db} }
 
+// WithTx returns a repository bound to an existing transaction so that confirm
+// or cancel operations can serialize against in-flight balance calculations.
+func (r *TransferRepository) WithTx(tx *gorm.DB) *TransferRepository {
+	return &TransferRepository{db: tx}
+}
+
 func (r *TransferRepository) List(ctx context.Context, filter TransferFilter) ([]model.TransferOperation, int64, error) {
 	filter.Page, filter.PageSize = normalizePage(filter.Page, filter.PageSize)
 	query := r.db.WithContext(ctx).Model(&model.TransferOperation{})
@@ -70,6 +76,11 @@ func (r *TransferRepository) Get(ctx context.Context, id uint) (model.TransferOp
 
 func (r *TransferRepository) Create(ctx context.Context, item *model.TransferOperation, actor Actor) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Balance calculations take the same tank lock first; taking it before
+		// overlap validation serializes draft creation against runs.
+		if _, err := NewTankRepository(tx).LockForUpdate(ctx, item.TankID); err != nil {
+			return err
+		}
 		var overlaps int64
 		if err := tx.Model(&model.TransferOperation{}).
 			Where("tank_id = ? AND operation_status <> ? AND start_at < ? AND end_at > ?", item.TankID, "cancelled", item.EndAt, item.StartAt).
@@ -99,6 +110,11 @@ func (r *TransferRepository) Transition(ctx context.Context, id, version uint, t
 				return api.NewError(404, "TRANSFER_NOT_FOUND", "物理转移记录不存在")
 			}
 			return fmt.Errorf("load transfer operation: %w", err)
+		}
+		// Confirm and cancel must serialize against an in-flight balance run for
+		// the same tank so a run can never miss or silently admit a transfer.
+		if _, err := NewTankRepository(tx).LockForUpdate(ctx, before.TankID); err != nil {
+			return err
 		}
 		if before.Version != version {
 			return api.NewError(409, "TRANSFER_VERSION_CONFLICT", "物理转移记录版本已变化，请刷新后重试")
@@ -131,10 +147,16 @@ func (r *TransferRepository) Transition(ctx context.Context, id, version uint, t
 	return updated, err
 }
 
-func (r *TransferRepository) ConfirmedForPeriod(ctx context.Context, tankID uint, start, end time.Time) ([]model.TransferOperation, error) {
+// ConfirmedIntersectingPeriod returns every confirmed transfer of the tank
+// whose time range intersects the closed period, including transfers spanning
+// across the period start or end. Callers must reject crossings rather than
+// truncating them. Draft and cancelled transfers are never returned, so they
+// cannot influence the balance. The method must be used on a repository bound
+// to the calculation transaction.
+func (r *TransferRepository) ConfirmedIntersectingPeriod(ctx context.Context, tankID uint, start, end time.Time) ([]model.TransferOperation, error) {
 	var items []model.TransferOperation
 	if err := r.db.WithContext(ctx).
-		Where("tank_id = ? AND operation_status = ? AND start_at >= ? AND end_at <= ?", tankID, "confirmed", start.UTC(), end.UTC()).
+		Where("tank_id = ? AND operation_status = ? AND start_at < ? AND end_at > ?", tankID, "confirmed", end.UTC(), start.UTC()).
 		Order("start_at ASC, id ASC").Find(&items).Error; err != nil {
 		return nil, fmt.Errorf("list confirmed period transfers: %w", err)
 	}

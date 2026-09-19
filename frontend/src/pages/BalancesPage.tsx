@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Alert, Button, Form, Input, Modal, Select, Table, Tag } from 'antd'
 import { CheckCircle2, Play, RefreshCw, Send, XCircle } from 'lucide-react'
+import { periodViolations, type PeriodBoundaryViolation } from '../api/client'
 import { EvidenceBreakdownPanel } from '../components/common/EvidenceBreakdownPanel'
 import { MassBalanceWaterfall } from '../components/common/MassBalanceWaterfall'
 import { PageHeader } from '../components/common/PageHeader'
@@ -23,21 +24,29 @@ export function BalancesPage() {
   const [runOpen, setRunOpen] = useState(false)
   const [reviewTarget, setReviewTarget] = useState<'accepted' | 'rejected'>('accepted')
   const [reviewOpen, setReviewOpen] = useState(false)
+  const [runRejection, setRunRejection] = useState<{ message: string; violations: PeriodBoundaryViolation[] } | null>(null)
   const [runForm] = Form.useForm<BalanceRunInput>()
   const [reviewForm] = Form.useForm<{ note: string }>()
   useEffect(() => { void Promise.all([store.load(), tanks.load()]) }, [])
   const selected = useMemo(() => store.items.find((item) => item.id === store.selectedId) ?? store.items[0], [store.items, store.selectedId])
   const openRun = () => {
+    setRunRejection(null)
     runForm.setFieldsValue({ tank_id: tanks.items[0]?.id })
     setRunOpen(true)
   }
   const run = async (values: BalanceRunInput) => {
-    await store.run({
-      tank_id: values.tank_id,
-      period_start: new Date(values.period_start).toISOString(),
-      period_end: new Date(values.period_end).toISOString()
-    })
-    setRunOpen(false)
+    setRunRejection(null)
+    try {
+      await store.run({
+        tank_id: values.tank_id,
+        period_start: new Date(values.period_start).toISOString(),
+        period_end: new Date(values.period_end).toISOString()
+      })
+      setRunOpen(false)
+    } catch (error) {
+      const violations = periodViolations(error)
+      setRunRejection({ message: error instanceof Error ? error.message : '平衡计算被拒绝', violations })
+    }
   }
   const review = async ({ note }: { note: string }) => {
     if (!selected) return
@@ -62,6 +71,32 @@ export function BalancesPage() {
           </>
         }
       />
+      {runRejection && (
+        <Alert
+          className="page-rejection"
+          type="error"
+          showIcon
+          message="平衡计算被拒绝，未生成平衡记录"
+          description={
+            <div>
+              <div>{runRejection.message}</div>
+              {runRejection.violations.length > 0 && (
+                <ul className="rejection-list">
+                  {runRejection.violations.map((violation) => (
+                    <li key={`${violation.transfer_id}-${violation.crossed_boundary}`}>
+                      转移 #{violation.transfer_id}（{violation.operation_type === 'inflow' ? '流入' : '流出'}）
+                      跨越期间{violation.crossed_boundary === 'period_start' ? '起点' : '终点'}
+                      （{dateTime(violation.boundary_at)}），越界时刻 {dateTime(violation.out_of_boundary_at)}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          }
+          closable
+          onClose={() => setRunRejection(null)}
+        />
+      )}
       <section className="balance-layout">
         <div className="balance-main">
           <div className="chart-panel">
@@ -127,6 +162,25 @@ export function BalancesPage() {
             <Form.Item name="period_end" label="期间结束" rules={[{ required: true }]}><Input type="datetime-local" /></Form.Item>
           </div>
           <Alert className="form-alert" type="warning" showIcon message="系统将选择期间边界有效快照并固化当前罐容系数；既有结果不会被覆盖。" />
+          {runRejection && (
+            <Alert
+              className="form-alert"
+              type="error"
+              showIcon
+              message={runRejection.message}
+              description={runRejection.violations.length > 0 ? (
+                <ul className="rejection-list">
+                  {runRejection.violations.map((violation) => (
+                    <li key={`${violation.transfer_id}-${violation.crossed_boundary}`}>
+                      转移 #{violation.transfer_id}（{violation.operation_type === 'inflow' ? '流入' : '流出'}）
+                      跨越期间{violation.crossed_boundary === 'period_start' ? '起点' : '终点'}
+                      （{dateTime(violation.boundary_at)}），越界时刻 {dateTime(violation.out_of_boundary_at)}
+                    </li>
+                  ))}
+                </ul>
+              ) : undefined}
+            />
+          )}
           <Button type="primary" htmlType="submit" icon={<Play size={16} />} loading={store.working} block>执行计算</Button>
         </Form>
       </Modal>

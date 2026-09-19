@@ -56,50 +56,115 @@ func (s *BalanceService) Run(ctx context.Context, request dto.RunBalanceRequest,
 	if end.Sub(start) > 90*24*time.Hour {
 		return model.BalanceRun{}, api.NewError(422, "BALANCE_PERIOD_TOO_LONG", "单次质量平衡期间不能超过 90 天")
 	}
+	// Existence check before the transaction; status and period inputs are
+	// re-read and locked inside CalculateAndStore.
+	if _, err := s.tankRepo.Get(ctx, request.TankID); err != nil {
+		return model.BalanceRun{}, err
+	}
+	run, err := s.repo.CalculateAndStore(ctx, request.TankID, start, end, actor, func(inputs repository.PeriodInputs) (*model.BalanceRun, error) {
+		contained, violations := classifyPeriodTransfers(inputs.Transfer, start, end)
+		if len(violations) > 0 {
+			return nil, periodBoundaryError(violations)
+		}
+		calculation, snapshotJSON, evidenceJSON, err := calculateBalanceRun(inputs.Tank, inputs.Opening, inputs.Closing, contained, start, end)
+		if err != nil {
+			return nil, err
+		}
+		return &model.BalanceRun{
+			TankID:             inputs.Tank.ID,
+			PeriodStart:        start,
+			PeriodEnd:          end,
+			BalanceStatus:      constants.BalanceCalculating,
+			InputSnapshotJSON:  datatypes.JSON(snapshotJSON),
+			EvidenceJSON:       datatypes.JSON(evidenceJSON),
+			OpeningMassKG:      calculation.OpeningMassKG,
+			ClosingMassKG:      calculation.ClosingMassKG,
+			NetTransferKG:      calculation.NetTransferKG,
+			EstimatedBOGKG:     calculation.EstimatedBOGKG,
+			UncertaintyKG:      calculation.UncertaintyKG,
+			IntervalLowerKG:    calculation.IntervalLowerKG,
+			IntervalUpperKG:    calculation.IntervalUpperKG,
+			DeviationPct:       calculation.DeviationPct,
+			DeviationLevel:     calculation.DeviationLevel,
+			CoefficientVersion: inputs.Tank.CoefficientVersion,
+			Version:            2,
+			CreatedBy:          actor.UserID,
+		}, nil
+	})
+	if err != nil {
+		return model.BalanceRun{}, err
+	}
 	tank, err := s.tankRepo.Get(ctx, request.TankID)
 	if err != nil {
 		return model.BalanceRun{}, err
 	}
-	if tank.TankStatus != "active" {
-		return model.BalanceRun{}, api.NewError(409, "TANK_NOT_ACTIVE", "只有启用储罐可以运行质量平衡")
-	}
-	opening, closing, err := s.measurementRepo.BoundarySnapshots(ctx, tank.ID, start, end)
-	if err != nil {
-		return model.BalanceRun{}, err
-	}
-	transfers, err := s.transferRepo.ConfirmedForPeriod(ctx, tank.ID, start, end)
-	if err != nil {
-		return model.BalanceRun{}, err
-	}
-	calculation, snapshotJSON, evidenceJSON, err := calculateBalanceRun(tank, opening, closing, transfers, start, end)
-	if err != nil {
-		return model.BalanceRun{}, err
-	}
-	run := model.BalanceRun{
-		TankID:             tank.ID,
-		PeriodStart:        start,
-		PeriodEnd:          end,
-		BalanceStatus:      constants.BalanceCalculating,
-		InputSnapshotJSON:  datatypes.JSON(snapshotJSON),
-		EvidenceJSON:       datatypes.JSON(evidenceJSON),
-		OpeningMassKG:      calculation.OpeningMassKG,
-		ClosingMassKG:      calculation.ClosingMassKG,
-		NetTransferKG:      calculation.NetTransferKG,
-		EstimatedBOGKG:     calculation.EstimatedBOGKG,
-		UncertaintyKG:      calculation.UncertaintyKG,
-		IntervalLowerKG:    calculation.IntervalLowerKG,
-		IntervalUpperKG:    calculation.IntervalUpperKG,
-		DeviationPct:       calculation.DeviationPct,
-		DeviationLevel:     calculation.DeviationLevel,
-		CoefficientVersion: tank.CoefficientVersion,
-		Version:            2,
-		CreatedBy:          actor.UserID,
-	}
-	if err := s.repo.CreateCalculated(ctx, &run, actor); err != nil {
-		return model.BalanceRun{}, err
-	}
 	run.Tank = &tank
 	return run, nil
+}
+
+// PeriodBoundaryViolation identifies a confirmed transfer that crosses a
+// period boundary instead of lying wholly inside the period.
+type PeriodBoundaryViolation struct {
+	TransferID      uint      `json:"transfer_id"`
+	OperationType   string    `json:"operation_type"`
+	CrossedBoundary string    `json:"crossed_boundary"`
+	BoundaryAt      time.Time `json:"boundary_at"`
+	OutOfBoundaryAt time.Time `json:"out_of_boundary_at"`
+}
+
+// classifyPeriodTransfers partitions the confirmed transfers that intersect the
+// closed [start, end] period into fully contained transfers and crossings.
+// Transfers merely touching a boundary (end == start or start == end) are not
+// inside the period and are silently excluded from the balance without being a
+// crossing; a crossing is strictly spanning across a boundary. Draft and
+// cancelled transfers are already excluded by the repository query.
+func classifyPeriodTransfers(transfers []model.TransferOperation, start, end time.Time) ([]model.TransferOperation, []PeriodBoundaryViolation) {
+	contained := make([]model.TransferOperation, 0, len(transfers))
+	violations := make([]PeriodBoundaryViolation, 0)
+	for _, transfer := range transfers {
+		// Only transfers intersecting the open interval (start, end) are in
+		// scope; a transfer ending exactly at the start or beginning exactly at
+		// the end carries no mass across the period and is neither counted nor a
+		// crossing.
+		if !transfer.StartAt.Before(end) || !transfer.EndAt.After(start) {
+			continue
+		}
+		crossesStart := transfer.StartAt.Before(start) && transfer.EndAt.After(start)
+		crossesEnd := transfer.EndAt.After(end) && transfer.StartAt.Before(end)
+		if !crossesStart && !crossesEnd {
+			contained = append(contained, transfer)
+			continue
+		}
+		if crossesStart {
+			violations = append(violations, PeriodBoundaryViolation{
+				TransferID: transfer.ID, OperationType: transfer.OperationType,
+				CrossedBoundary: "period_start", BoundaryAt: start, OutOfBoundaryAt: transfer.StartAt,
+			})
+		}
+		if crossesEnd {
+			violations = append(violations, PeriodBoundaryViolation{
+				TransferID: transfer.ID, OperationType: transfer.OperationType,
+				CrossedBoundary: "period_end", BoundaryAt: end, OutOfBoundaryAt: transfer.EndAt,
+			})
+		}
+	}
+	return contained, violations
+}
+
+func periodBoundaryError(violations []PeriodBoundaryViolation) error {
+	first := violations[0]
+	return api.WithDetails(api.NewError(422, "TRANSFER_CROSSES_PERIOD_BOUNDARY",
+		fmt.Sprintf("已确认转移 #%d 跨越期间%s，平衡已整体拒绝；请调整期间或先处理该转移。",
+			first.TransferID, boundaryName(first.CrossedBoundary))), map[string]any{
+		"violations": violations,
+	})
+}
+
+func boundaryName(boundary string) string {
+	if boundary == "period_start" {
+		return "起点"
+	}
+	return "终点"
 }
 
 type calculatedBalance struct {

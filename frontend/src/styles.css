@@ -88,6 +88,9 @@ h2 { margin: 0; font-size: 17px; line-height: 1.35; letter-spacing: 0; }
 .form-grid .ant-input-number { width: 100%; }
 .form-alert, .bottom-alert { margin-bottom: 18px; }
 .bottom-alert { margin-top: 24px; }
+.page-rejection { margin: 16px 0; }
+.rejection-list { margin: 8px 0 0; padding-left: 18px; }
+.rejection-list li { margin-bottom: 4px; }
 
 .login-shell { min-height: 100vh; display: grid; grid-template-columns: minmax(440px, 1.05fr) minmax(420px, 0.95fr); background: #f5f8f8; }
 .login-context { position: relative; min-height: 640px; display: flex; flex-direction: column; justify-content: center; padding: 72px 9%; overflow: hidden; color: #f1f7f7; background: #294147; }

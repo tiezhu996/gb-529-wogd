@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"lng-boiloff-gas-balance/backend/internal/constants"
 	"lng-boiloff-gas-balance/backend/internal/model"
@@ -16,6 +17,34 @@ type TankRepository struct {
 }
 
 func NewTankRepository(db *gorm.DB) *TankRepository { return &TankRepository{db: db} }
+
+// WithTx returns a repository bound to an existing transaction so that
+// service-level units of work can share the same transaction.
+func (r *TankRepository) WithTx(tx *gorm.DB) *TankRepository { return &TankRepository{db: tx} }
+
+// LockForUpdate takes a transaction-scoped row lock on the tank. On PostgreSQL
+// it emits SELECT ... FOR UPDATE; SQLite has no row-level locking, so a no-op
+// UPDATE acquires the write lock that serializes writers per database.
+func (r *TankRepository) LockForUpdate(ctx context.Context, id uint) (model.StorageTank, error) {
+	var tank model.StorageTank
+	query := r.db.WithContext(ctx)
+	if r.db.Dialector.Name() == "postgres" {
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	if err := query.First(&tank, id).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return model.StorageTank{}, api.NewError(404, "TANK_NOT_FOUND", "储罐不存在")
+		}
+		return model.StorageTank{}, fmt.Errorf("lock storage tank for update: %w", err)
+	}
+	if r.db.Dialector.Name() != "postgres" {
+		if err := r.db.WithContext(ctx).
+			Exec("UPDATE storage_tanks SET id = id WHERE id = ?", id).Error; err != nil {
+			return model.StorageTank{}, fmt.Errorf("acquire storage tank write lock: %w", err)
+		}
+	}
+	return tank, nil
+}
 
 func (r *TankRepository) List(ctx context.Context, page, pageSize int, status string) ([]model.StorageTank, int64, error) {
 	page, pageSize = normalizePage(page, pageSize)

@@ -29,6 +29,11 @@ func NewMeasurementRepository(db *gorm.DB) *MeasurementRepository {
 	return &MeasurementRepository{db: db}
 }
 
+// WithTx returns a repository bound to an existing transaction.
+func (r *MeasurementRepository) WithTx(tx *gorm.DB) *MeasurementRepository {
+	return &MeasurementRepository{db: tx}
+}
+
 func (r *MeasurementRepository) List(ctx context.Context, filter MeasurementFilter) ([]model.MeasurementSnapshot, int64, error) {
 	filter.Page, filter.PageSize = normalizePage(filter.Page, filter.PageSize)
 	query := r.db.WithContext(ctx).Model(&model.MeasurementSnapshot{})
@@ -69,6 +74,10 @@ func (r *MeasurementRepository) Get(ctx context.Context, id uint) (model.Measure
 
 func (r *MeasurementRepository) Create(ctx context.Context, snapshot *model.MeasurementSnapshot, actor Actor) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Serialize snapshot writers with balance calculations for the same tank.
+		if _, err := NewTankRepository(tx).LockForUpdate(ctx, snapshot.TankID); err != nil {
+			return err
+		}
 		var existing int64
 		if err := tx.Model(&model.MeasurementSnapshot{}).
 			Where("tank_id = ? AND measured_at = ?", snapshot.TankID, snapshot.MeasuredAt).
@@ -89,6 +98,9 @@ func (r *MeasurementRepository) Create(ctx context.Context, snapshot *model.Meas
 	})
 }
 
+// BoundarySnapshots re-reads the opening and closing boundary snapshots.
+// It must be invoked on a repository bound to the calculation transaction so
+// that both snapshots are read together with the physical transfers.
 func (r *MeasurementRepository) BoundarySnapshots(ctx context.Context, tankID uint, periodStart, periodEnd time.Time) (model.MeasurementSnapshot, model.MeasurementSnapshot, error) {
 	var opening model.MeasurementSnapshot
 	openingQuery := r.db.WithContext(ctx).

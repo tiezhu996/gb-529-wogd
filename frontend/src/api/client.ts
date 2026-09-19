@@ -7,10 +7,25 @@ export class ApiError extends Error {
     message: string,
     public readonly status: number,
     public readonly code: string,
-    public readonly requestId?: string
+    public readonly requestId?: string,
+    public readonly details?: Record<string, unknown>
   ) {
     super(message)
   }
+}
+
+export interface PeriodBoundaryViolation {
+  transfer_id: number
+  operation_type: string
+  crossed_boundary: 'period_start' | 'period_end'
+  boundary_at: string
+  out_of_boundary_at: string
+}
+
+export function periodViolations(error: unknown): PeriodBoundaryViolation[] {
+  if (!(error instanceof ApiError) || !error.details) return []
+  const raw = error.details.violations
+  return Array.isArray(raw) ? raw as PeriodBoundaryViolation[] : []
 }
 
 export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -33,7 +48,8 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
       payload.error?.message ?? `请求失败 (${response.status})`,
       response.status,
       payload.error?.code ?? 'REQUEST_FAILED',
-      payload.request_id
+      payload.request_id,
+      payload.error?.details as Record<string, unknown> | undefined
     )
     if (response.status === 401 && path !== '/auth/login') {
       sessionStorage.removeItem(tokenKey)
