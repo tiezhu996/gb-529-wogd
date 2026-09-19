@@ -1,0 +1,12 @@
+.env
+.DS_Store
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+*.log
+*.db
+*.sqlite
+.idea/
+.vscode/
+.cache/
